@@ -57,6 +57,7 @@ dependencies {
     checkstyle 'com.puppycrawl.tools:checkstyle:10.4'
     testImplementation 'org.junit.jupiter:junit-jupiter:5.9.0'
     testImplementation 'org.hamcrest:hamcrest:2.2'
+    implementation 'net.java.dev.jna:jna:5.18.1'
 }
 
 compileJava {
