@@ -13,6 +13,7 @@ pom.xml
 .project
 .classpath
 .settings
+.vscode/*
 .idea
 *.iml
 *.ipr

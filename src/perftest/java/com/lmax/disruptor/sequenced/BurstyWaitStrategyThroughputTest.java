@@ -49,21 +49,26 @@ import java.util.concurrent.ThreadFactory;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.locks.LockSupport;
 
 /**
  * Bursty wait-strategy throughput test.
  *
- * <p>The saturated Disruptor throughput tests mostly measure publish/consume hot paths.  This test deliberately
- * alternates producer bursts and idle gaps, and can pin donor threads to the consumer CPU, so wait strategies spend
- * measurable time in their waiting paths before the consumer has to wake up and drain the next burst.
+ * <p>
+ * * The saturated Disruptor throughput tests mostly measure publish/consume hot
+ * paths. This test deliberately
+ * alternates producer bursts and idle gaps, and can pin donor threads to the
+ * consumer CPU, so wait strategies spend
+ * measurable time in their waiting paths before the consumer has to wake up and
+ * drain the next burst.
  */
-public final class BurstyWaitStrategyThroughputTest
-{
+public final class BurstyWaitStrategyThroughputTest {
     private static final int DEFAULT_RUNS = 7;
     private static final int DEFAULT_BUFFER_SIZE = 1024 * 64;
     private static final int DEFAULT_BURST_SIZE = 256;
     private static final int DEFAULT_BURSTS = 100_000;
     private static final long DEFAULT_PAUSE_NANOS = 100_000L;
+    private static final int DEFAULT_CONSUMER_WORK_ITERATIONS = 64;
     private static final long DEFAULT_CONSUMER_WORK_NANOS = 0L;
     private static final int DEFAULT_PRODUCERS = 1;
     private static final int DEFAULT_DONOR_THREADS = 0;
@@ -71,79 +76,85 @@ public final class BurstyWaitStrategyThroughputTest
     private static final String DEFAULT_PRODUCER_CPUS = "";
     private static final String DEFAULT_DONOR_CPUS = "";
     private static final int NO_CPU = -1;
+    private static final long PAUSE_SPIN_THRESHOLD_NANOS = TimeUnit.MICROSECONDS.toNanos(50);
 
     private static volatile long blackhole;
 
     private final Config config;
 
-    private BurstyWaitStrategyThroughputTest(final Config config)
-    {
+    private BurstyWaitStrategyThroughputTest(final Config config) {
         this.config = config;
     }
 
-    public static void main(final String[] args) throws Exception
-    {
+    public static void main(final String[] args) throws Exception {
+        // Load the benchmark shape from JVM system properties and run several passes
+        // so the caller can discard warm-up/noisy results if needed.
         Config config = Config.fromProperties();
         BurstyWaitStrategyThroughputTest test = new BurstyWaitStrategyThroughputTest(config);
 
         System.out.println(config.toHeader());
-        for (int i = 0; i < config.runs; i++)
-        {
+        for (int i = 0; i < config.runs; i++) {
             System.gc();
             PassResult result = test.runPass(i);
             System.out.println(result.toLine(config));
         }
     }
 
-    private PassResult runPass(final int run) throws Exception
-    {
+    private PassResult runPass(final int run) throws Exception {
+        // Build a fresh Disruptor pipeline for each pass so one run does not retain
+        // cursor state, wait-strategy state, or executor state from the previous run.
         final WaitStrategy waitStrategy = newWaitStrategy(config);
         final RingBuffer<BurstyEvent> ringBuffer = config.producers == 1
-            ? RingBuffer.createSingleProducer(BurstyEvent::new, config.bufferSize, waitStrategy)
-            : RingBuffer.createMultiProducer(BurstyEvent::new, config.bufferSize, waitStrategy);
+                ? RingBuffer.createSingleProducer(BurstyEvent::new, config.bufferSize, waitStrategy)
+                : RingBuffer.createMultiProducer(BurstyEvent::new, config.bufferSize, waitStrategy);
         final SequenceBarrier sequenceBarrier = ringBuffer.newBarrier();
         final CountDownLatch completionLatch = new CountDownLatch(1);
         final BurstRecordingEventHandler handler = new BurstRecordingEventHandler(config, completionLatch);
-        final BatchEventProcessor<BurstyEvent> processor =
-            new BatchEventProcessorBuilder().build(ringBuffer, sequenceBarrier, handler);
+        final BatchEventProcessor<BurstyEvent> processor = new BatchEventProcessorBuilder().build(ringBuffer,
+                sequenceBarrier, handler);
         final CyclicBarrier startBarrier = new CyclicBarrier(config.producers + 1);
         final AtomicBoolean donorsRunning = new AtomicBoolean(true);
 
         ringBuffer.addGatingSequences(processor.getSequence());
 
+        // Optionally pin consumer, producer, and donor threads to specific CPUs.
+        // Leaving a CPU list empty lets the OS scheduler place the threads normally.
         ExecutorService consumerExecutor = Executors.newSingleThreadExecutor(
-            new PinnedThreadFactory("bursty-consumer", singleCpu(config.consumerCpu)));
+                new PinnedThreadFactory("bursty-consumer", singleCpu(config.consumerCpu)));
         ExecutorService producerExecutor = Executors.newFixedThreadPool(
-            config.producers, new PinnedThreadFactory("bursty-producer", config.producerCpus));
+                config.producers, new PinnedThreadFactory("bursty-producer", config.producerCpus));
         ExecutorService donorExecutor = config.donorThreads == 0
-            ? null
-            : Executors.newFixedThreadPool(
-                config.donorThreads, new PinnedThreadFactory("bursty-donor", config.donorCpus));
+                ? null
+                : Executors.newFixedThreadPool(
+                        config.donorThreads, new PinnedThreadFactory("bursty-donor", config.donorCpus));
 
         List<Future<?>> donorFutures = new ArrayList<>();
-        if (donorExecutor != null)
-        {
-            for (int i = 0; i < config.donorThreads; i++)
-            {
+        if (donorExecutor != null) {
+            // Donor threads burn CPU in the background. They can be pinned to the
+            // consumer CPU to make scheduler contention visible in wait-strategy results.
+            for (int i = 0; i < config.donorThreads; i++) {
                 donorFutures.add(donorExecutor.submit(new Donor(donorsRunning)));
             }
         }
 
         List<Future<?>> producerFutures = new ArrayList<>();
-        for (int i = 0; i < config.producers; i++)
-        {
-            producerFutures.add(producerExecutor.submit(new Producer(i, ringBuffer, startBarrier, handler.burstStartTimes)));
+        for (int i = 0; i < config.producers; i++) {
+            producerFutures
+                    .add(producerExecutor.submit(new Producer(i, ringBuffer, startBarrier, handler.burstStartTimes)));
         }
 
         Future<?> consumerFuture = consumerExecutor.submit(processor);
+        // Producers wait on the barrier, so the measured interval starts just before
+        // all producers are released into their burst/pause loops.
         long startedAt = System.nanoTime();
         startBarrier.await();
 
-        for (Future<?> future : producerFutures)
-        {
+        for (Future<?> future : producerFutures) {
             future.get();
         }
 
+        // Producers may finish publishing before the consumer has drained the last
+        // burst, so wait for the handler to observe the final sequence.
         completionLatch.await();
         long completedAt = System.nanoTime();
 
@@ -153,11 +164,9 @@ public final class BurstyWaitStrategyThroughputTest
 
         shutdown(producerExecutor);
         shutdown(consumerExecutor);
-        if (donorExecutor != null)
-        {
+        if (donorExecutor != null) {
             shutdown(donorExecutor);
-            for (Future<?> future : donorFutures)
-            {
+            for (Future<?> future : donorFutures) {
                 future.get();
             }
         }
@@ -165,30 +174,30 @@ public final class BurstyWaitStrategyThroughputTest
         return handler.toResult(run, completedAt - startedAt);
     }
 
-    private static int[] singleCpu(final int cpu)
-    {
-        if (cpu < 0)
-        {
+    private static int[] singleCpu(final int cpu) {
+        // Thread factories accept a round-robin CPU list. Convert the single consumer
+        // CPU setting into that representation.
+        if (cpu < 0) {
             return new int[0];
         }
-        return new int[]{cpu};
+        return new int[] { cpu };
     }
 
-    private static void shutdown(final ExecutorService executor) throws InterruptedException
-    {
+    private static void shutdown(final ExecutorService executor) throws InterruptedException {
+        // Prefer an orderly shutdown, then force termination if a benchmark worker
+        // failed to exit after halt/signalling.
         executor.shutdown();
-        if (!executor.awaitTermination(5, TimeUnit.SECONDS))
-        {
+        if (!executor.awaitTermination(5, TimeUnit.SECONDS)) {
             executor.shutdownNow();
             executor.awaitTermination(5, TimeUnit.SECONDS);
         }
     }
 
-    private static WaitStrategy newWaitStrategy(final Config config)
-    {
+    private static WaitStrategy newWaitStrategy(final Config config) {
+        // Create the wait strategy under test. All strategies share the same burst
+        // workload; only the consumer waiting behavior changes between runs.
         final WaitStrategy waitStrategy;
-        switch (config.waitStrategy)
-        {
+        switch (config.waitStrategy) {
             case "busyspin":
                 waitStrategy = new BusySpinWaitStrategy();
                 break;
@@ -205,7 +214,7 @@ public final class BurstyWaitStrategyThroughputTest
                 waitStrategy = new LiteBlockingWaitStrategy();
                 break;
             case "phasedbackoff":
-                waitStrategy = PhasedBackoffWaitStrategy.withLiteLock(10, 100, TimeUnit.MICROSECONDS);
+                waitStrategy = PhasedBackoffWaitStrategy.withSleep(10, 100, TimeUnit.MICROSECONDS);
                 break;
             case "tddy":
                 waitStrategy = new TddyWaitStrategy(config.tddySpinTries);
@@ -216,75 +225,88 @@ public final class BurstyWaitStrategyThroughputTest
         return waitStrategy;
     }
 
-    private static void spinForNanos(final long nanos)
-    {
-        if (nanos <= 0)
-        {
+    private static void pauseForNanos(final long nanos) {
+        // Park during long producer pauses so the benchmark models idle burst gaps
+        // without keeping producer threads runnable. Spin only near the deadline to
+        // preserve a precise pause shape for short gaps.
+        if (nanos <= 0) {
             return;
         }
 
         long deadline = System.nanoTime() + nanos;
-        while (System.nanoTime() < deadline)
-        {
+        long remaining;
+        while ((remaining = deadline - System.nanoTime()) > PAUSE_SPIN_THRESHOLD_NANOS) {
+            LockSupport.parkNanos(remaining - PAUSE_SPIN_THRESHOLD_NANOS);
+        }
+
+        while (System.nanoTime() < deadline) {
             Thread.onSpinWait();
         }
     }
 
-    private static void burnForNanos(final long nanos)
-    {
-        if (nanos <= 0)
-        {
+    // private static void burnForNanos(final long nanos) {
+    // // Optional legacy timed work. Prefer burnWork(iterations, seed) for
+    // // throughput comparisons because it keeps the amount of work fixed.
+    // if (nanos <= 0) {
+    // return;
+    // }
+
+    // long value = blackhole;
+    // long deadline = System.nanoTime() + nanos;
+    // while (System.nanoTime() < deadline) {
+    // value = (value * 31) + 17;
+    // }
+    // blackhole = value;
+    // }
+
+    private static void burnWork(final int iterations, final long seed) {
+        if (iterations <= 0) {
             return;
         }
 
-        long value = blackhole;
-        long deadline = System.nanoTime() + nanos;
-        while (System.nanoTime() < deadline)
-        {
-            value = (value * 31) + 17;
+        long value = blackhole ^ seed;
+        for (int i = 0; i < iterations; i++) {
+            value ^= value << 13;
+            value ^= value >>> 7;
+            value ^= value << 17;
         }
         blackhole = value;
     }
 
-    public static final class BurstyEvent
-    {
+    public static final class BurstyEvent {
+        // Identifies which burst this event belongs to and where it sits within
+        // that burst, allowing the handler to time complete burst drains.
         private int burstSlot;
         private int indexInBurst;
 
-        public int getBurstSlot()
-        {
+        public int getBurstSlot() {
             return burstSlot;
         }
 
-        public void setBurstSlot(final int burstSlot)
-        {
+        public void setBurstSlot(final int burstSlot) {
             this.burstSlot = burstSlot;
         }
 
-        public int getIndexInBurst()
-        {
+        public int getIndexInBurst() {
             return indexInBurst;
         }
 
-        public void setIndexInBurst(final int indexInBurst)
-        {
+        public void setIndexInBurst(final int indexInBurst) {
             this.indexInBurst = indexInBurst;
         }
     }
 
-    private final class Producer implements Runnable
-    {
+    private final class Producer implements Runnable {
         private final int producerIndex;
         private final RingBuffer<BurstyEvent> ringBuffer;
         private final CyclicBarrier startBarrier;
         private final long[] burstStartTimes;
 
         Producer(
-            final int producerIndex,
-            final RingBuffer<BurstyEvent> ringBuffer,
-            final CyclicBarrier startBarrier,
-            final long[] burstStartTimes)
-        {
+                final int producerIndex,
+                final RingBuffer<BurstyEvent> ringBuffer,
+                final CyclicBarrier startBarrier,
+                final long[] burstStartTimes) {
             this.producerIndex = producerIndex;
             this.ringBuffer = ringBuffer;
             this.startBarrier = startBarrier;
@@ -292,57 +314,51 @@ public final class BurstyWaitStrategyThroughputTest
         }
 
         @Override
-        public void run()
-        {
-            try
-            {
+        public void run() {
+            try {
+                // Synchronize the start so all producers begin their first burst
+                // at roughly the same time.
                 startBarrier.await();
-                for (int burst = 0; burst < config.bursts; burst++)
-                {
+                for (int burst = 0; burst < config.bursts; burst++) {
                     int burstSlot = producerIndex * config.bursts + burst;
                     burstStartTimes[burstSlot] = System.nanoTime();
-                    for (int i = 0; i < config.burstSize; i++)
-                    {
+                    // Publish a compact burst of events with no intentional gap
+                    // between individual publications.
+                    for (int i = 0; i < config.burstSize; i++) {
                         long sequence = ringBuffer.next();
-                        try
-                        {
+                        try {
                             BurstyEvent event = ringBuffer.get(sequence);
                             event.setBurstSlot(burstSlot);
                             event.setIndexInBurst(i);
-                        }
-                        finally
-                        {
+                        } finally {
                             ringBuffer.publish(sequence);
                         }
                     }
-                    spinForNanos(config.pauseNanos);
+                    // After each burst, leave the consumer idle long enough to enter
+                    // the wait strategy's waiting path before the next burst arrives.
+                    pauseForNanos(config.pauseNanos);
                 }
-            }
-            catch (Exception ex)
-            {
+            } catch (Exception ex) {
                 throw new RuntimeException(ex);
             }
         }
     }
 
-    private static final class Donor implements Runnable
-    {
+    private static final class Donor implements Runnable {
         private final AtomicBoolean running;
 
-        Donor(final AtomicBoolean running)
-        {
+        Donor(final AtomicBoolean running) {
             this.running = running;
         }
 
         @Override
-        public void run()
-        {
+        public void run() {
+            // Continuously burn CPU until the pass ends. This is used to model
+            // scheduler pressure from unrelated runnable work.
             long value = blackhole;
-            while (running.get())
-            {
+            while (running.get()) {
                 value = (value * 31) + 17;
-                if ((value & 1023L) == 0)
-                {
+                if ((value & 1023L) == 0) {
                     Thread.onSpinWait();
                 }
             }
@@ -350,8 +366,9 @@ public final class BurstyWaitStrategyThroughputTest
         }
     }
 
-    private static final class BurstRecordingEventHandler implements com.lmax.disruptor.EventHandler<BurstyEvent>
-    {
+    private static final class BurstRecordingEventHandler implements com.lmax.disruptor.EventHandler<BurstyEvent> {
+        // Records per-burst drain latency while also counting BatchEventProcessor
+        // batch starts to estimate how much batching the wait strategy enabled.
         private final Config config;
         private final CountDownLatch completionLatch;
         private final long totalEvents;
@@ -359,8 +376,7 @@ public final class BurstyWaitStrategyThroughputTest
         private final long[] burstDrainTimes;
         private long batchesProcessed;
 
-        BurstRecordingEventHandler(final Config config, final CountDownLatch completionLatch)
-        {
+        BurstRecordingEventHandler(final Config config, final CountDownLatch completionLatch) {
             this.config = config;
             this.completionLatch = completionLatch;
             this.totalEvents = config.totalEvents();
@@ -369,52 +385,53 @@ public final class BurstyWaitStrategyThroughputTest
         }
 
         @Override
-        public void onEvent(final BurstyEvent event, final long sequence, final boolean endOfBatch)
-        {
-            burnForNanos(config.consumerWorkNanos);
-            if (event.getIndexInBurst() == config.burstSize - 1)
-            {
+        public void onEvent(final BurstyEvent event, final long sequence, final boolean endOfBatch) {
+            burnWork(config.consumerWorkIterations, sequence);
+            // burnForNanos(config.consumerWorkNanos);
+            // The final event in a burst closes that burst's latency sample.
+            if (event.getIndexInBurst() == config.burstSize - 1) {
                 burstDrainTimes[event.getBurstSlot()] = System.nanoTime() - burstStartTimes[event.getBurstSlot()];
             }
-            if (sequence == totalEvents - 1)
-            {
+            // Signal benchmark completion only after the consumer has processed the
+            // final event, not merely after producers have published it.
+            if (sequence == totalEvents - 1) {
                 completionLatch.countDown();
             }
         }
 
         @Override
-        public void onBatchStart(final long batchSize, final long queueDepth)
-        {
+        public void onBatchStart(final long batchSize, final long queueDepth) {
+            // One callback is made per processor batch. Fewer batches means more
+            // events were consumed together after each wait.
             batchesProcessed++;
         }
 
-        PassResult toResult(final int run, final long wallNanos)
-        {
+        PassResult toResult(final int run, final long wallNanos) {
+            // Percentiles are computed over complete burst drain times, while
+            // drainTotal is used to estimate active throughput excluding idle gaps.
             long[] sortedDrainTimes = burstDrainTimes.clone();
             Arrays.sort(sortedDrainTimes);
 
             long drainTotal = 0;
-            for (long drainTime : burstDrainTimes)
-            {
+            for (long drainTime : burstDrainTimes) {
                 drainTotal += drainTime;
             }
 
             return new PassResult(
-                run,
-                wallNanos,
-                totalEvents,
-                batchesProcessed,
-                percentile(sortedDrainTimes, 50),
-                percentile(sortedDrainTimes, 95),
-                percentile(sortedDrainTimes, 99),
-                drainTotal);
+                    run,
+                    wallNanos,
+                    totalEvents,
+                    batchesProcessed,
+                    percentile(sortedDrainTimes, 50),
+                    percentile(sortedDrainTimes, 95),
+                    percentile(sortedDrainTimes, 99),
+                    drainTotal);
         }
     }
 
-    private static long percentile(final long[] sortedValues, final int percentile)
-    {
-        if (sortedValues.length == 0)
-        {
+    private static long percentile(final long[] sortedValues, final int percentile) {
+        // Use the nearest-rank percentile over a pre-sorted sample array.
+        if (sortedValues.length == 0) {
             return 0;
         }
 
@@ -422,8 +439,7 @@ public final class BurstyWaitStrategyThroughputTest
         return sortedValues[Math.max(0, Math.min(sortedValues.length - 1, index))];
     }
 
-    private static final class PassResult
-    {
+    private static final class PassResult {
         private final int run;
         private final long wallNanos;
         private final long totalEvents;
@@ -434,15 +450,14 @@ public final class BurstyWaitStrategyThroughputTest
         private final long drainTotalNanos;
 
         PassResult(
-            final int run,
-            final long wallNanos,
-            final long totalEvents,
-            final long batchesProcessed,
-            final long drainP50Nanos,
-            final long drainP95Nanos,
-            final long drainP99Nanos,
-            final long drainTotalNanos)
-        {
+                final int run,
+                final long wallNanos,
+                final long totalEvents,
+                final long batchesProcessed,
+                final long drainP50Nanos,
+                final long drainP95Nanos,
+                final long drainP99Nanos,
+                final long drainTotalNanos) {
             this.run = run;
             this.wallNanos = wallNanos;
             this.totalEvents = totalEvents;
@@ -453,66 +468,66 @@ public final class BurstyWaitStrategyThroughputTest
             this.drainTotalNanos = drainTotalNanos;
         }
 
-        String toLine(final Config config)
-        {
+        String toLine(final Config config) {
+            // Emit stable key=value output so external benchmark scripts can parse
+            // multiple wait strategies and compare them directly.
             return String.format(
-                Locale.ROOT,
-                "result wait_strategy=%s producers=%d burst_size=%d bursts=%d pause_ns=%d " +
-                    "consumer_work_ns=%d donor_threads=%d run=%d ops_sec=%d active_drain_ops_sec=%d " +
-                    "batch_percent=%.2f avg_batch_size=%d drain_p50_ns=%d drain_p95_ns=%d drain_p99_ns=%d",
-                config.waitStrategy,
-                config.producers,
-                config.burstSize,
-                config.bursts,
-                config.pauseNanos,
-                config.consumerWorkNanos,
-                config.donorThreads,
-                run,
-                opsPerSecond(totalEvents, wallNanos),
-                opsPerSecond(totalEvents, drainTotalNanos),
-                batchPercent(),
-                averageBatchSize(),
-                drainP50Nanos,
-                drainP95Nanos,
-                drainP99Nanos);
+                    Locale.ROOT,
+                    "result wait_strategy=%s producers=%d burst_size=%d bursts=%d pause_ns=%d " +
+                            "consumer_work_iterations=%d consumer_work_ns=%d donor_threads=%d run=%d " +
+                            "ops_sec=%d active_drain_ops_sec=%d " +
+                            "batch_percent=%.2f avg_batch_size=%d drain_p50_ns=%d drain_p95_ns=%d drain_p99_ns=%d",
+                    config.waitStrategy,
+                    config.producers,
+                    config.burstSize,
+                    config.bursts,
+                    config.pauseNanos,
+                    config.consumerWorkIterations,
+                    config.consumerWorkNanos,
+                    config.donorThreads,
+                    run,
+                    opsPerSecond(totalEvents, wallNanos),
+                    opsPerSecond(totalEvents, drainTotalNanos),
+                    batchPercent(),
+                    averageBatchSize(),
+                    drainP50Nanos,
+                    drainP95Nanos,
+                    drainP99Nanos);
         }
 
-        private double batchPercent()
-        {
-            if (batchesProcessed == 0)
-            {
+        private double batchPercent() {
+            // Percentage of events that avoided being the start of their own batch.
+            if (batchesProcessed == 0) {
                 return 0.0d;
             }
             return (1.0d - ((double) batchesProcessed / totalEvents)) * 100.0d;
         }
 
-        private long averageBatchSize()
-        {
-            if (batchesProcessed == 0)
-            {
+        private long averageBatchSize() {
+            // Integer average is sufficient for the log output and keeps the result
+            // format compact.
+            if (batchesProcessed == 0) {
                 return -1L;
             }
             return totalEvents / batchesProcessed;
         }
     }
 
-    private static long opsPerSecond(final long events, final long nanos)
-    {
-        if (nanos <= 0)
-        {
+    private static long opsPerSecond(final long events, final long nanos) {
+        if (nanos <= 0) {
             return 0L;
         }
         return (long) ((events * 1_000_000_000.0d) / nanos);
     }
 
-    private static final class Config
-    {
+    private static final class Config {
         private final int runs;
         private final String waitStrategy;
         private final int bufferSize;
         private final int burstSize;
         private final int bursts;
         private final long pauseNanos;
+        private final int consumerWorkIterations;
         private final long consumerWorkNanos;
         private final int producers;
         private final int consumerCpu;
@@ -522,26 +537,27 @@ public final class BurstyWaitStrategyThroughputTest
         private final int tddySpinTries;
 
         private Config(
-            final int runs,
-            final String waitStrategy,
-            final int bufferSize,
-            final int burstSize,
-            final int bursts,
-            final long pauseNanos,
-            final long consumerWorkNanos,
-            final int producers,
-            final int consumerCpu,
-            final int[] producerCpus,
-            final int[] donorCpus,
-            final int donorThreads,
-            final int tddySpinTries)
-        {
+                final int runs,
+                final String waitStrategy,
+                final int bufferSize,
+                final int burstSize,
+                final int bursts,
+                final long pauseNanos,
+                final int consumerWorkIterations,
+                final long consumerWorkNanos,
+                final int producers,
+                final int consumerCpu,
+                final int[] producerCpus,
+                final int[] donorCpus,
+                final int donorThreads,
+                final int tddySpinTries) {
             this.runs = runs;
             this.waitStrategy = waitStrategy;
             this.bufferSize = bufferSize;
             this.burstSize = burstSize;
             this.bursts = bursts;
             this.pauseNanos = pauseNanos;
+            this.consumerWorkIterations = consumerWorkIterations;
             this.consumerWorkNanos = consumerWorkNanos;
             this.producers = producers;
             this.consumerCpu = consumerCpu;
@@ -551,120 +567,118 @@ public final class BurstyWaitStrategyThroughputTest
             this.tddySpinTries = tddySpinTries;
         }
 
-        static Config fromProperties()
-        {
+        static Config fromProperties() {
+            // All knobs are JVM properties so shell benchmark scripts can sweep
+            // strategies and workload shapes without recompiling.
             int producers = intProperty("producers", DEFAULT_PRODUCERS);
             int consumerCpu = intProperty("consumerCpu", NO_CPU);
             int[] producerCpus = cpuListProperty("producerCpus", DEFAULT_PRODUCER_CPUS);
             int[] donorCpus = cpuListProperty("donorCpus", DEFAULT_DONOR_CPUS);
 
             return new Config(
-                intProperty("runs", DEFAULT_RUNS),
-                System.getProperty("waitStrategy", DEFAULT_STRATEGY).toLowerCase(Locale.ROOT),
-                intProperty("bufferSize", DEFAULT_BUFFER_SIZE),
-                intProperty("burstSize", DEFAULT_BURST_SIZE),
-                intProperty("bursts", DEFAULT_BURSTS),
-                longProperty("pauseNs", DEFAULT_PAUSE_NANOS),
-                longProperty("consumerWorkNs", DEFAULT_CONSUMER_WORK_NANOS),
-                producers,
-                consumerCpu,
-                producerCpus,
-                donorCpus,
-                intProperty("donorThreads", DEFAULT_DONOR_THREADS),
-                intProperty("tddySpinTries", 100));
+                    intProperty("runs", DEFAULT_RUNS),
+                    System.getProperty("waitStrategy", DEFAULT_STRATEGY).toLowerCase(Locale.ROOT),
+                    intProperty("bufferSize", DEFAULT_BUFFER_SIZE),
+                    intProperty("burstSize", DEFAULT_BURST_SIZE),
+                    intProperty("bursts", DEFAULT_BURSTS),
+                    longProperty("pauseNs", DEFAULT_PAUSE_NANOS),
+                    intProperty("consumerWorkIterations", DEFAULT_CONSUMER_WORK_ITERATIONS),
+                    longProperty("consumerWorkNs", DEFAULT_CONSUMER_WORK_NANOS),
+                    producers,
+                    consumerCpu,
+                    producerCpus,
+                    donorCpus,
+                    intProperty("donorThreads", DEFAULT_DONOR_THREADS),
+                    intProperty("tddySpinTries", 100));
         }
 
-        long totalEvents()
-        {
+        long totalEvents() {
+            // Every producer emits the same number of fixed-size bursts.
             return (long) producers * bursts * burstSize;
         }
 
-        int totalBursts()
-        {
+        int totalBursts() {
+            // Burst timing arrays are indexed by producer-local burst slots.
             return producers * bursts;
         }
 
-        String toHeader()
-        {
+        String toHeader() {
+            // Print the effective configuration once before pass results.
             return String.format(
-                Locale.ROOT,
-                "config wait_strategy=%s runs=%d producers=%d buffer_size=%d burst_size=%d bursts=%d " +
-                    "pause_ns=%d consumer_work_ns=%d consumer_cpu=%d producer_cpus=%s donor_cpus=%s " +
-                    "donor_threads=%d tddy_spin_tries=%d",
-                waitStrategy,
-                runs,
-                producers,
-                bufferSize,
-                burstSize,
-                bursts,
-                pauseNanos,
-                consumerWorkNanos,
-                consumerCpu,
-                Arrays.toString(producerCpus),
-                Arrays.toString(donorCpus),
-                donorThreads,
-                tddySpinTries);
+                    Locale.ROOT,
+                    "config wait_strategy=%s runs=%d producers=%d buffer_size=%d burst_size=%d bursts=%d " +
+                            "pause_ns=%d consumer_work_iterations=%d consumer_work_ns=%d consumer_cpu=%d " +
+                            "producer_cpus=%s donor_cpus=%s donor_threads=%d tddy_spin_tries=%d",
+                    waitStrategy,
+                    runs,
+                    producers,
+                    bufferSize,
+                    burstSize,
+                    bursts,
+                    pauseNanos,
+                    consumerWorkIterations,
+                    consumerWorkNanos,
+                    consumerCpu,
+                    Arrays.toString(producerCpus),
+                    Arrays.toString(donorCpus),
+                    donorThreads,
+                    tddySpinTries);
         }
     }
 
-    private static int intProperty(final String name, final int defaultValue)
-    {
+    private static int intProperty(final String name, final int defaultValue) {
+        // Empty properties are treated the same as missing properties to simplify
+        // shell script argument composition.
         String value = System.getProperty(name);
-        if (value == null || value.isEmpty())
-        {
+        if (value == null || value.isEmpty()) {
             return defaultValue;
         }
         return Integer.parseInt(value);
     }
 
-    private static long longProperty(final String name, final long defaultValue)
-    {
+    private static long longProperty(final String name, final long defaultValue) {
+        // Empty properties are treated the same as missing properties to simplify
+        // shell script argument composition.
         String value = System.getProperty(name);
-        if (value == null || value.isEmpty())
-        {
+        if (value == null || value.isEmpty()) {
             return defaultValue;
         }
         return Long.parseLong(value);
     }
 
-    private static int[] cpuListProperty(final String name, final String defaultValue)
-    {
+    private static int[] cpuListProperty(final String name, final String defaultValue) {
+        // CPU lists are comma-separated and later assigned to threads round-robin.
         String value = System.getProperty(name, defaultValue);
-        if (value == null || value.trim().isEmpty())
-        {
+        if (value == null || value.trim().isEmpty()) {
             return new int[0];
         }
 
         String[] parts = value.split(",");
         int[] cpus = new int[parts.length];
-        for (int i = 0; i < parts.length; i++)
-        {
+        for (int i = 0; i < parts.length; i++) {
             cpus[i] = Integer.parseInt(parts[i].trim());
         }
         return cpus;
     }
 
-    private static final class PinnedThreadFactory implements ThreadFactory
-    {
+    private static final class PinnedThreadFactory implements ThreadFactory {
         private final String namePrefix;
         private final int[] cpus;
         private final AtomicInteger counter = new AtomicInteger();
 
-        PinnedThreadFactory(final String namePrefix, final int[] cpus)
-        {
+        PinnedThreadFactory(final String namePrefix, final int[] cpus) {
             this.namePrefix = namePrefix;
             this.cpus = cpus.clone();
         }
 
         @Override
-        public Thread newThread(final Runnable runnable)
-        {
+        public Thread newThread(final Runnable runnable) {
+            // Round-robin through the configured CPU list so fixed thread pools can
+            // spread workers across a small set of CPUs.
             int threadIndex = counter.getAndIncrement();
             int cpu = cpus.length == 0 ? NO_CPU : cpus[threadIndex % cpus.length];
-            Thread thread = new Thread(() ->
-            {
-                if (cpu >= 0)
-                {
+            Thread thread = new Thread(() -> {
+                if (cpu >= 0) {
                     LinuxAffinity.bindToCpu(cpu);
                 }
                 runnable.run();
@@ -675,56 +689,52 @@ public final class BurstyWaitStrategyThroughputTest
         }
     }
 
-    private static final class LinuxAffinity
-    {
+    private static final class LinuxAffinity {
         private static final LibC LIBC = Native.load("c", LibC.class, functionMapperOptions());
         private static final int LONG_BITS = Long.SIZE;
         private static final int CPU_SET_LONGS = 16;
 
-        private LinuxAffinity()
-        {
+        private LinuxAffinity() {
         }
 
-        static void bindToCpu(final int cpu)
-        {
+        static void bindToCpu(final int cpu) {
+            // Bind the current native thread to a single Linux CPU using sched_setaffinity.
             CpuSet cpuSet = new CpuSet();
             cpuSet.set(cpu);
             int rc = LIBC.schedSetAffinity(0, cpuSet.size(), cpuSet);
-            if (rc != 0)
-            {
-                throw new IllegalStateException("sched_setaffinity cpu=" + cpu + " failed errno=" + Native.getLastError());
+            if (rc != 0) {
+                throw new IllegalStateException(
+                        "sched_setaffinity cpu=" + cpu + " failed errno=" + Native.getLastError());
             }
         }
 
-        private static Map<String, Object> functionMapperOptions()
-        {
+        private static Map<String, Object> functionMapperOptions() {
+            // JNA maps Java method names literally by default; map the camelCase
+            // wrapper method to the libc symbol name.
             Map<String, Object> options = new HashMap<>();
-            options.put(Library.OPTION_FUNCTION_MAPPER, (FunctionMapper) (library, method) ->
-                "schedSetAffinity".equals(method.getName()) ? "sched_setaffinity" : method.getName());
+            options.put(Library.OPTION_FUNCTION_MAPPER, (FunctionMapper) (library,
+                    method) -> "schedSetAffinity".equals(method.getName()) ? "sched_setaffinity" : method.getName());
             return options;
         }
 
-        public interface LibC extends Library
-        {
+        public interface LibC extends Library {
             int schedSetAffinity(int pid, int cpusetsize, CpuSet mask) throws LastErrorException;
         }
 
-        public static final class CpuSet extends Structure
-        {
+        public static final class CpuSet extends Structure {
             public long[] bits = new long[CPU_SET_LONGS];
 
-            void set(final int cpu)
-            {
-                if (cpu < 0 || cpu >= CPU_SET_LONGS * LONG_BITS)
-                {
+            void set(final int cpu) {
+                // Represent cpu_set_t as a bitset backed by longs. This supports
+                // CPU IDs in the range [0, CPU_SET_LONGS * LONG_BITS).
+                if (cpu < 0 || cpu >= CPU_SET_LONGS * LONG_BITS) {
                     throw new IllegalArgumentException("cpu out of supported range: " + cpu);
                 }
                 bits[cpu / LONG_BITS] |= 1L << (cpu % LONG_BITS);
             }
 
             @Override
-            protected List<String> getFieldOrder()
-            {
+            protected List<String> getFieldOrder() {
                 return Collections.singletonList("bits");
             }
         }
