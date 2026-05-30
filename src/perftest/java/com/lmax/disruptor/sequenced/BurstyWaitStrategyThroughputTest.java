@@ -77,6 +77,7 @@ public final class BurstyWaitStrategyThroughputTest {
     private static final String DEFAULT_DONOR_CPUS = "";
     private static final int NO_CPU = -1;
     private static final long PAUSE_SPIN_THRESHOLD_NANOS = TimeUnit.MICROSECONDS.toNanos(50);
+    private static final long DONOR_COUNTER_SAMPLE_MASK = 1023L;
 
     private static volatile long blackhole;
 
@@ -128,12 +129,15 @@ public final class BurstyWaitStrategyThroughputTest {
                 : Executors.newFixedThreadPool(
                         config.donorThreads, new PinnedThreadFactory("bursty-donor", config.donorCpus));
 
+        List<Donor> donors = new ArrayList<>();
         List<Future<?>> donorFutures = new ArrayList<>();
         if (donorExecutor != null) {
             // Donor threads burn CPU in the background. They can be pinned to the
             // consumer CPU to make scheduler contention visible in wait-strategy results.
             for (int i = 0; i < config.donorThreads; i++) {
-                donorFutures.add(donorExecutor.submit(new Donor(donorsRunning)));
+                Donor donor = new Donor(donorsRunning);
+                donors.add(donor);
+                donorFutures.add(donorExecutor.submit(donor));
             }
         }
 
@@ -147,6 +151,7 @@ public final class BurstyWaitStrategyThroughputTest {
         // Producers wait on the barrier, so the measured interval starts just before
         // all producers are released into their burst/pause loops.
         long startedAt = System.nanoTime();
+        long donorStartedOperations = donorOperations(donors);
         startBarrier.await();
 
         for (Future<?> future : producerFutures) {
@@ -157,10 +162,11 @@ public final class BurstyWaitStrategyThroughputTest {
         // burst, so wait for the handler to observe the final sequence.
         completionLatch.await();
         long completedAt = System.nanoTime();
+        long donorCompletedOperations = donorOperations(donors);
+        donorsRunning.set(false);
 
         processor.halt();
         consumerFuture.get();
-        donorsRunning.set(false);
 
         shutdown(producerExecutor);
         shutdown(consumerExecutor);
@@ -171,7 +177,16 @@ public final class BurstyWaitStrategyThroughputTest {
             }
         }
 
-        return handler.toResult(run, completedAt - startedAt);
+        long measuredDonorOperations = Math.max(0, donorCompletedOperations - donorStartedOperations);
+        return handler.toResult(run, completedAt - startedAt, measuredDonorOperations);
+    }
+
+    private static long donorOperations(final List<Donor> donors) {
+        long operations = 0;
+        for (Donor donor : donors) {
+            operations += donor.operations();
+        }
+        return operations;
     }
 
     private static int[] singleCpu(final int cpu) {
@@ -346,9 +361,14 @@ public final class BurstyWaitStrategyThroughputTest {
 
     private static final class Donor implements Runnable {
         private final AtomicBoolean running;
+        private volatile long operations;
 
         Donor(final AtomicBoolean running) {
             this.running = running;
+        }
+
+        long operations() {
+            return operations;
         }
 
         @Override
@@ -356,12 +376,16 @@ public final class BurstyWaitStrategyThroughputTest {
             // Continuously burn CPU until the pass ends. This is used to model
             // scheduler pressure from unrelated runnable work.
             long value = blackhole;
+            long localOperations = operations;
             while (running.get()) {
                 value = (value * 31) + 17;
-                if ((value & 1023L) == 0) {
+                localOperations++;
+                if ((localOperations & DONOR_COUNTER_SAMPLE_MASK) == 0) {
+                    operations = localOperations;
                     Thread.onSpinWait();
                 }
             }
+            operations = localOperations;
             blackhole = value;
         }
     }
@@ -406,7 +430,7 @@ public final class BurstyWaitStrategyThroughputTest {
             batchesProcessed++;
         }
 
-        PassResult toResult(final int run, final long wallNanos) {
+        PassResult toResult(final int run, final long wallNanos, final long donorOperations) {
             // Percentiles are computed over complete burst drain times, while
             // drainTotal is used to estimate active throughput excluding idle gaps.
             long[] sortedDrainTimes = burstDrainTimes.clone();
@@ -425,7 +449,8 @@ public final class BurstyWaitStrategyThroughputTest {
                     percentile(sortedDrainTimes, 50),
                     percentile(sortedDrainTimes, 95),
                     percentile(sortedDrainTimes, 99),
-                    drainTotal);
+                    drainTotal,
+                    donorOperations);
         }
     }
 
@@ -448,6 +473,7 @@ public final class BurstyWaitStrategyThroughputTest {
         private final long drainP95Nanos;
         private final long drainP99Nanos;
         private final long drainTotalNanos;
+        private final long donorOperations;
 
         PassResult(
                 final int run,
@@ -457,7 +483,8 @@ public final class BurstyWaitStrategyThroughputTest {
                 final long drainP50Nanos,
                 final long drainP95Nanos,
                 final long drainP99Nanos,
-                final long drainTotalNanos) {
+                final long drainTotalNanos,
+                final long donorOperations) {
             this.run = run;
             this.wallNanos = wallNanos;
             this.totalEvents = totalEvents;
@@ -466,6 +493,7 @@ public final class BurstyWaitStrategyThroughputTest {
             this.drainP95Nanos = drainP95Nanos;
             this.drainP99Nanos = drainP99Nanos;
             this.drainTotalNanos = drainTotalNanos;
+            this.donorOperations = donorOperations;
         }
 
         String toLine(final Config config) {
@@ -475,7 +503,7 @@ public final class BurstyWaitStrategyThroughputTest {
                     Locale.ROOT,
                     "result wait_strategy=%s producers=%d burst_size=%d bursts=%d pause_ns=%d " +
                             "consumer_work_iterations=%d consumer_work_ns=%d donor_threads=%d run=%d " +
-                            "ops_sec=%d active_drain_ops_sec=%d " +
+                            "ops_sec=%d active_drain_ops_sec=%d donor_ops_sec=%d donor_ops_sec_per_thread=%d " +
                             "batch_percent=%.2f avg_batch_size=%d drain_p50_ns=%d drain_p95_ns=%d drain_p99_ns=%d",
                     config.waitStrategy,
                     config.producers,
@@ -488,6 +516,8 @@ public final class BurstyWaitStrategyThroughputTest {
                     run,
                     opsPerSecond(totalEvents, wallNanos),
                     opsPerSecond(totalEvents, drainTotalNanos),
+                    donorOpsPerSecond(),
+                    donorOpsPerSecondPerThread(config),
                     batchPercent(),
                     averageBatchSize(),
                     drainP50Nanos,
@@ -510,6 +540,17 @@ public final class BurstyWaitStrategyThroughputTest {
                 return -1L;
             }
             return totalEvents / batchesProcessed;
+        }
+
+        private long donorOpsPerSecond() {
+            return opsPerSecond(donorOperations, wallNanos);
+        }
+
+        private long donorOpsPerSecondPerThread(final Config config) {
+            if (config.donorThreads == 0) {
+                return 0L;
+            }
+            return donorOpsPerSecond() / config.donorThreads;
         }
     }
 

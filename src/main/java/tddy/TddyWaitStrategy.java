@@ -29,8 +29,7 @@ public final class TddyWaitStrategy implements WaitStrategy {
     /**
      * Native tddy speedup state for the current thread.
      */
-    // private final ThreadLocal<Boolean> speedupEnabled =
-    // ThreadLocal.withInitial(() -> false);
+    private final ThreadLocal<Boolean> speedupEnabled = ThreadLocal.withInitial(() -> false);
 
     /**
      * Provides a tddy wait strategy with the default spin and yield settings.
@@ -68,8 +67,7 @@ public final class TddyWaitStrategy implements WaitStrategy {
             counter = newCounter;
         }
 
-        TddyNative.INSTANCE.tddy_java_speedup(1);
-        // speedupOnIfNeeded();
+        speedupOnIfNeeded();
 
         return availableSequence;
     }
@@ -81,7 +79,7 @@ public final class TddyWaitStrategy implements WaitStrategy {
     private int applyWaitMethod(final SequenceBarrier barrier, final int counter, final long idleCounter)
             throws AlertException {
         barrier.checkAlert();
-        // speedupOffIfNeeded();
+        speedupOffIfNeeded();
 
         if (counter > 0) {
             Thread.onSpinWait();
@@ -104,17 +102,17 @@ public final class TddyWaitStrategy implements WaitStrategy {
         }
     }
 
-    // private void speedupOnIfNeeded() {
-    // if (!speedupEnabled.get()) {
-    // TddyNative.INSTANCE.tddy_java_speedup(1);
-    // speedupEnabled.set(true);
-    // }
-    // }
+    private void speedupOnIfNeeded() {
+        if (!speedupEnabled.get()) {
+            TddyNative.INSTANCE.tddy_java_speedup(1);
+            speedupEnabled.set(true);
+        }
+    }
 
-    // private void speedupOffIfNeeded() {
-    // if (speedupEnabled.get()) {
-    // TddyNative.INSTANCE.tddy_java_speedup(0);
-    // speedupEnabled.set(false);
-    // }
-    // }
+    private void speedupOffIfNeeded() {
+        if (speedupEnabled.get()) {
+            TddyNative.INSTANCE.tddy_java_speedup(0);
+            speedupEnabled.set(false);
+        }
+    }
 }
