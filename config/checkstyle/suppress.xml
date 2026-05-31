@@ -16,4 +16,6 @@
 
     <suppress checks="FinalParameters"
               files="(examples)[\\/].*"/>
+    <suppress checks="MethodName"
+              files="src[\\/]main[\\/]java[\\/]tddy[\\/]TddyNative\.java"/>
 </suppressions>
